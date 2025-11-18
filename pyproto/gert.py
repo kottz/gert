@@ -129,7 +129,10 @@ def main():
     if channels:
         print("\nLIVE channels you follow:")
         for c in channels:
-            print(f"{c['user_name']} — {c['title']} ({c['viewer_count']} viewers)")
+            game = c.get("game_name") or "Unknown game"
+            print(
+                f"{c['user_name']} — {c['title']} — {game} ({c['viewer_count']} viewers)"
+            )
     else:
         print("No followed channels are live right now.")
 
