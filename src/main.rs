@@ -11,13 +11,14 @@ use reqwest::{
     header::{AUTHORIZATION, HeaderMap, HeaderValue},
 };
 use serde::{Deserialize, Serialize};
+use time::{Duration as TimeDuration, OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::{
     fs,
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     sync::oneshot,
     task::JoinHandle,
-    time,
+    time as tokio_time,
 };
 use url::form_urlencoded;
 
@@ -28,6 +29,79 @@ const CACHE_TTL_SECONDS: f64 = 60.0;
 const AUTH_BASE_URL: &str = "https://id.twitch.tv/oauth2/authorize";
 const BASE_URL: &str = "https://api.twitch.tv/helix";
 const SCOPES: &[&str] = &["user:read:follows"];
+const TOKEN_CAPTURE_HTML: &str = r"<html><body>
+<script>
+const params = new URLSearchParams(window.location.hash.substring(1));
+const token = params.get('access_token');
+if (token) {
+    fetch('/token?access_token=' + token)
+        .then(() => document.body.innerHTML = '<h2>Authorization complete. You can close this window.</h2>')
+        .catch(() => document.body.innerHTML = '<h2>Failed to send token.</h2>');
+} else {
+    document.body.innerHTML = '<h2>No token found in URL.</h2>';
+}
+</script>
+</body></html>";
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct TokenData {
+    #[serde(default)]
+    access_token: Option<String>,
+    #[serde(default)]
+    user_id: Option<String>,
+    #[serde(default)]
+    timestamp: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct CachePayload {
+    #[serde(default)]
+    user_id: Option<String>,
+    #[serde(default)]
+    timestamp: Option<f64>,
+    #[serde(default)]
+    channels: Vec<LiveChannel>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LiveChannel {
+    user_name: String,
+    title: String,
+    #[serde(default)]
+    game_name: Option<String>,
+    viewer_count: u64,
+    #[serde(default)]
+    started_at: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct UsersResponse {
+    data: Vec<TwitchUser>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TwitchUser {
+    id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct StreamsResponse {
+    data: Vec<LiveChannel>,
+    #[serde(default)]
+    pagination: Option<Pagination>,
+}
+
+#[derive(Debug, Deserialize)]
+struct Pagination {
+    cursor: Option<String>,
+}
+
+#[derive(Serialize)]
+struct StreamsParams<'a> {
+    user_id: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    after: Option<&'a str>,
+}
 
 #[tokio::main]
 async fn main() {
@@ -344,10 +418,11 @@ async fn run_oauth_server(listener: TcpListener, tx: oneshot::Sender<String>) ->
 }
 
 async fn handle_http_request(stream: &mut TcpStream) -> Result<Option<String>> {
-    let request = match time::timeout(Duration::from_secs(30), read_http_request(stream)).await {
-        Ok(result) => result?,
-        Err(_) => return Ok(None),
-    };
+    let request =
+        match tokio_time::timeout(Duration::from_secs(30), read_http_request(stream)).await {
+            Ok(result) => result?,
+            Err(_) => return Ok(None),
+        };
 
     let mut parts = request.lines();
     let request_line = parts.next().unwrap_or("").trim();
@@ -445,10 +520,48 @@ fn display_channels(channels: &[LiveChannel]) {
     println!("\nLIVE channels you follow:");
     for channel in channels {
         let game = channel.game_name.as_deref().unwrap_or("Unknown game");
+        let live_for = format_live_duration(channel.started_at.as_deref());
         println!(
-            "{} — {} — {} ({} viewers)",
-            channel.user_name, channel.title, game, channel.viewer_count
+            "{} — {} — {} — live for {} ({} viewers)",
+            channel.user_name, channel.title, game, live_for, channel.viewer_count
         );
+    }
+}
+
+fn format_live_duration(started_at: Option<&str>) -> String {
+    let started_at = match started_at {
+        Some(value) => value,
+        None => return "live time unknown".to_string(),
+    };
+
+    let start = match OffsetDateTime::parse(started_at, &Rfc3339) {
+        Ok(parsed) => parsed,
+        Err(_) => return "live time unknown".to_string(),
+    };
+
+    let elapsed = OffsetDateTime::now_utc() - start;
+    if elapsed.is_negative() {
+        return "live just now".to_string();
+    }
+
+    human_readable_duration(elapsed)
+}
+
+fn human_readable_duration(duration: TimeDuration) -> String {
+    let total_seconds = duration.whole_seconds();
+    let days = total_seconds / 86_400;
+    let hours = (total_seconds % 86_400) / 3_600;
+    let minutes = (total_seconds % 3_600) / 60;
+    let seconds = total_seconds % 60;
+
+    if days > 0 {
+        format!("{days}d {hours}h")
+    } else if hours > 0 {
+        format!("{hours}h {minutes}m")
+    } else if minutes > 0 {
+        format!("{minutes}m {seconds}s")
+    } else {
+        format!("{seconds}s")
     }
 }
 
@@ -505,75 +618,3 @@ async fn get_live_followed_channels(client: &Client, user_id: &str) -> Result<Ve
 
     Ok(channels)
 }
-
-#[derive(Debug, Default, Serialize, Deserialize)]
-struct TokenData {
-    #[serde(default)]
-    access_token: Option<String>,
-    #[serde(default)]
-    user_id: Option<String>,
-    #[serde(default)]
-    timestamp: Option<f64>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-struct CachePayload {
-    #[serde(default)]
-    user_id: Option<String>,
-    #[serde(default)]
-    timestamp: Option<f64>,
-    #[serde(default)]
-    channels: Vec<LiveChannel>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct LiveChannel {
-    user_name: String,
-    title: String,
-    #[serde(default)]
-    game_name: Option<String>,
-    viewer_count: u64,
-}
-
-#[derive(Debug, Deserialize)]
-struct UsersResponse {
-    data: Vec<TwitchUser>,
-}
-
-#[derive(Debug, Deserialize)]
-struct TwitchUser {
-    id: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct StreamsResponse {
-    data: Vec<LiveChannel>,
-    #[serde(default)]
-    pagination: Option<Pagination>,
-}
-
-#[derive(Debug, Deserialize)]
-struct Pagination {
-    cursor: Option<String>,
-}
-
-#[derive(Serialize)]
-struct StreamsParams<'a> {
-    user_id: &'a str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    after: Option<&'a str>,
-}
-
-const TOKEN_CAPTURE_HTML: &str = r"<html><body>
-<script>
-const params = new URLSearchParams(window.location.hash.substring(1));
-const token = params.get('access_token');
-if (token) {
-    fetch('/token?access_token=' + token)
-        .then(() => document.body.innerHTML = '<h2>Authorization complete. You can close this window.</h2>')
-        .catch(() => document.body.innerHTML = '<h2>Failed to send token.</h2>');
-} else {
-    document.body.innerHTML = '<h2>No token found in URL.</h2>';
-}
-</script>
-</body></html>";
