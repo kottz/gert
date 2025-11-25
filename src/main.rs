@@ -165,25 +165,25 @@ impl AppConfig {
     fn from_env() -> Result<Self> {
         let mut client_id = None;
 
-        if let Ok(env_id) = std::env::var("GERT_CLIENT_ID") {
-            if !env_id.trim().is_empty() {
-                println!("Using client id from GERT_CLIENT_ID env var");
-                client_id = Some(env_id);
-            }
+        if let Ok(env_id) = std::env::var("GERT_CLIENT_ID")
+            && !env_id.trim().is_empty()
+        {
+            println!("Using client id from GERT_CLIENT_ID env var");
+            client_id = Some(env_id);
         }
 
-        if client_id.is_none() {
-            if let Ok(proj_dirs) = get_project_dirs() {
-                let config_dir = proj_dirs.config_dir();
+        if client_id.is_none()
+            && let Ok(proj_dirs) = get_project_dirs()
+        {
+            let config_dir = proj_dirs.config_dir();
 
-                let env_path = config_dir.join(".env");
-                let conf_path = config_dir.join("gert.conf");
+            let env_path = config_dir.join(".env");
+            let conf_path = config_dir.join("gert.conf");
 
-                if let Some(id) = read_client_id_from_file(&env_path) {
-                    client_id = Some(id);
-                } else if let Some(id) = read_client_id_from_file(&conf_path) {
-                    client_id = Some(id);
-                }
+            if let Some(id) = read_client_id_from_file(&env_path) {
+                client_id = Some(id);
+            } else if let Some(id) = read_client_id_from_file(&conf_path) {
+                client_id = Some(id);
             }
         }
 
