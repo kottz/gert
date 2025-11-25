@@ -5,6 +5,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow};
+use directories::ProjectDirs;
 use reqwest::{
     Client,
     header::{AUTHORIZATION, HeaderMap, HeaderValue},
@@ -88,18 +89,7 @@ struct AppConfig {
 
 impl AppConfig {
     fn from_env() -> Result<Self> {
-        let home = home_dir()?;
-        let config_dir = format!("{}/.config/gert", home);
-        let env_path = format!("{config_dir}/.env");
-        let conf_path = format!("{config_dir}/gert.conf");
-
         let mut client_id = None;
-
-        if let Some(id) = read_client_id_from_file(&env_path) {
-            client_id = Some(id);
-        } else if let Some(id) = read_client_id_from_file(&conf_path) {
-            client_id = Some(id);
-        }
 
         if let Ok(env_id) = std::env::var("GERT_CLIENT_ID") {
             if !env_id.trim().is_empty() {
@@ -108,44 +98,61 @@ impl AppConfig {
             }
         }
 
+        if client_id.is_none() {
+            if let Ok(proj_dirs) = get_project_dirs() {
+                let config_dir = proj_dirs.config_dir();
+
+                let env_path = config_dir.join(".env");
+                let conf_path = config_dir.join("gert.conf");
+
+                if let Some(id) = read_client_id_from_file(&env_path) {
+                    client_id = Some(id);
+                } else if let Some(id) = read_client_id_from_file(&conf_path) {
+                    client_id = Some(id);
+                }
+            }
+        }
+
         if let Some(client_id) = client_id {
             Ok(Self { client_id })
         } else {
+            let path_hint = if let Ok(proj_dirs) = get_project_dirs() {
+                proj_dirs.config_dir().display().to_string()
+            } else {
+                "configuration directory".to_string()
+            };
+
             Err(anyhow!(
-                "missing client id; set GERT_CLIENT_ID or add client_id=... to {} or {}",
-                env_path,
-                conf_path
+                "missing client id; set GERT_CLIENT_ID or add client_id=... to a gert.conf inside {}",
+                path_hint
             ))
         }
     }
 }
 
-fn home_dir() -> Result<String> {
-    std::env::var("HOME").context("HOME environment variable not set")
+/// Provides platform-appropriate directories for this application.
+fn get_project_dirs() -> Result<ProjectDirs> {
+    ProjectDirs::from("", "", "gert").context("could not determine home directory or project paths")
 }
 
 fn state_dir() -> Result<PathBuf> {
-    let base = if let Ok(dir) = std::env::var("XDG_STATE_HOME") {
-        PathBuf::from(dir)
-    } else {
-        PathBuf::from(format!("{}/.local/state", home_dir()?))
-    };
-    let dir = base.join("gert");
-    std::fs::create_dir_all(&dir)
+    let proj_dirs = get_project_dirs()?;
+    let dir = proj_dirs.data_local_dir();
+
+    std::fs::create_dir_all(dir)
         .with_context(|| format!("failed to create state directory at {}", dir.display()))?;
-    Ok(dir)
+
+    Ok(dir.to_path_buf())
 }
 
 fn cache_dir() -> Result<PathBuf> {
-    let base = if let Ok(dir) = std::env::var("XDG_CACHE_HOME") {
-        PathBuf::from(dir)
-    } else {
-        PathBuf::from(format!("{}/.cache", home_dir()?))
-    };
-    let dir = base.join("gert");
-    std::fs::create_dir_all(&dir)
+    let proj_dirs = get_project_dirs()?;
+    let dir = proj_dirs.cache_dir();
+
+    std::fs::create_dir_all(dir)
         .with_context(|| format!("failed to create cache directory at {}", dir.display()))?;
-    Ok(dir)
+
+    Ok(dir.to_path_buf())
 }
 
 fn token_file_path() -> Result<PathBuf> {
@@ -156,7 +163,7 @@ fn cache_file_path() -> Result<PathBuf> {
     Ok(cache_dir()?.join(CACHE_FILE_NAME))
 }
 
-fn read_client_id_from_file(path: &str) -> Option<String> {
+fn read_client_id_from_file<P: AsRef<std::path::Path>>(path: P) -> Option<String> {
     let contents = std::fs::read_to_string(path).ok()?;
     for line in contents.lines() {
         let line = line.trim();
