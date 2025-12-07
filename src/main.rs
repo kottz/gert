@@ -7,7 +7,7 @@ use std::{
 use anyhow::{Context, Result, anyhow};
 use directories::ProjectDirs;
 use reqwest::{
-    Client,
+    Client, StatusCode,
     header::{AUTHORIZATION, HeaderMap, HeaderValue},
 };
 use serde::{Deserialize, Serialize};
@@ -22,13 +22,16 @@ use tokio::{
 };
 use url::form_urlencoded;
 
-const REDIRECT_URI: &str = "http://localhost:3000";
+const PORT: u16 = 44764;
+const REDIRECT_URI: &str = "http://localhost:44764";
+
 const TOKEN_FILE_NAME: &str = "token_public.json";
 const CACHE_FILE_NAME: &str = "gert_cache.json";
 const CACHE_TTL_SECONDS: f64 = 60.0;
 const AUTH_BASE_URL: &str = "https://id.twitch.tv/oauth2/authorize";
 const BASE_URL: &str = "https://api.twitch.tv/helix";
 const SCOPES: &[&str] = &["user:read:follows"];
+
 const TOKEN_CAPTURE_HTML: &str = r"<html><body>
 <script>
 const params = new URLSearchParams(window.location.hash.substring(1));
@@ -103,6 +106,11 @@ struct StreamsParams<'a> {
     after: Option<&'a str>,
 }
 
+#[derive(Deserialize)]
+struct AppConfig {
+    client_id: String,
+}
+
 #[tokio::main]
 async fn main() {
     if let Err(err) = run().await {
@@ -116,49 +124,88 @@ async fn run() -> Result<()> {
 
     let stored_user_id = load_user_id().await;
     let cached_payload = load_cache_payload().await;
-    let (cached_channels, cached_user_id) = match cached_payload {
-        Some(payload) => (Some(payload.channels), payload.user_id),
-        None => (None, None),
-    };
 
-    if let Some(channels) = cached_channels {
+    if let Some(payload) = cached_payload {
         let mismatch = stored_user_id
             .as_ref()
-            .and_then(|stored| cached_user_id.as_ref().map(|cached| stored != cached))
+            .and_then(|stored| payload.user_id.as_ref().map(|cached| stored != cached))
             .unwrap_or(false);
+
         if !mismatch {
             if stored_user_id.is_none()
-                && let Some(user_id) = cached_user_id.clone()
+                && let Some(user_id) = payload.user_id.clone()
             {
                 save_user_id(&user_id).await?;
             }
             println!("Using cached live channel results (polled < 60s ago).");
-            display_channels(&channels);
+            display_channels(&payload.channels);
             return Ok(());
         }
     }
 
-    let token = get_token(&config.client_id).await?;
-    let client = build_client(&token, &config.client_id)?;
+    let mut token = get_token(&config.client_id).await?;
+    let mut client = build_client(&token, &config.client_id)?;
 
     let user_id = if let Some(ref id) = stored_user_id {
         id.clone()
     } else {
-        let id = get_user_id(&client).await?;
-        save_user_id(&id).await?;
-        id
+        // Attempt to fetch User ID from API
+        match get_user_id(&client).await {
+            Ok(id) => {
+                save_user_id(&id).await?;
+                id
+            }
+            Err(err) if is_unauthorized(&err) => {
+                println!("Access token expired. Re-authenticating...");
+                // Token invalid: force refresh
+                token = force_refresh_token(&config.client_id).await?;
+                client = build_client(&token, &config.client_id)?;
+                // Retry API call
+                let id = get_user_id(&client)
+                    .await
+                    .context("failed to fetch user ID after re-authentication")?;
+                save_user_id(&id).await?;
+                id
+            }
+            Err(e) => return Err(e),
+        }
     };
 
-    let channels = get_live_followed_channels(&client, &user_id).await?;
+    // Note: Even if user_id was valid, the token might expire exactly now, or be invalid for this specific scope
+    let channels = match get_live_followed_channels(&client, &user_id).await {
+        Ok(c) => c,
+        Err(err) if is_unauthorized(&err) => {
+            println!("Access token expired during execution. Re-authenticating...");
+            token = force_refresh_token(&config.client_id).await?;
+            client = build_client(&token, &config.client_id)?;
+            // Retry API call
+            get_live_followed_channels(&client, &user_id)
+                .await
+                .context("failed to fetch channels after re-authentication")?
+        }
+        Err(e) => return Err(e),
+    };
+
     save_cached_channels(&user_id, &channels).await?;
     display_channels(&channels);
 
     Ok(())
 }
 
-#[derive(Deserialize)]
-struct AppConfig {
-    client_id: String,
+fn is_unauthorized(err: &anyhow::Error) -> bool {
+    if let Some(reqwest_err) = err.downcast_ref::<reqwest::Error>()
+        && let Some(status) = reqwest_err.status() {
+            return status == StatusCode::UNAUTHORIZED;
+        }
+    false
+}
+
+async fn force_refresh_token(client_id: &str) -> Result<String> {
+    if let Ok(path) = token_file_path()
+        && fs::try_exists(&path).await.unwrap_or(false) {
+            let _ = fs::remove_file(&path).await;
+        }
+    get_token(client_id).await
 }
 
 impl AppConfig {
@@ -176,7 +223,6 @@ impl AppConfig {
             && let Ok(proj_dirs) = get_project_dirs()
         {
             let config_dir = proj_dirs.config_dir();
-
             let env_path = config_dir.join(".env");
             let conf_path = config_dir.join("gert.conf");
 
@@ -204,7 +250,6 @@ impl AppConfig {
     }
 }
 
-/// Provides platform-appropriate directories for this application.
 fn get_project_dirs() -> Result<ProjectDirs> {
     ProjectDirs::from("", "", "gert").context("could not determine home directory or project paths")
 }
@@ -212,20 +257,16 @@ fn get_project_dirs() -> Result<ProjectDirs> {
 fn state_dir() -> Result<PathBuf> {
     let proj_dirs = get_project_dirs()?;
     let dir = proj_dirs.data_local_dir();
-
     std::fs::create_dir_all(dir)
         .with_context(|| format!("failed to create state directory at {}", dir.display()))?;
-
     Ok(dir.to_path_buf())
 }
 
 fn cache_dir() -> Result<PathBuf> {
     let proj_dirs = get_project_dirs()?;
     let dir = proj_dirs.cache_dir();
-
     std::fs::create_dir_all(dir)
         .with_context(|| format!("failed to create cache directory at {}", dir.display()))?;
-
     Ok(dir.to_path_buf())
 }
 
@@ -364,15 +405,23 @@ async fn get_token(client_id: &str) -> Result<String> {
     println!("Opening browser for Twitch login...");
     let auth_url = build_auth_url(client_id);
     let (tx, rx) = oneshot::channel();
+
+    // Start server before opening browser to ensure it's ready
     let server = start_oauth_server(tx).await?;
+
     webbrowser::open(&auth_url).context("failed to open system browser")?;
-    println!("Waiting for token...");
-    let token = rx
-        .await
-        .context("did not receive access token from browser flow")?;
-    server
-        .await
-        .map_err(|_| anyhow!("OAuth callback server task panicked"))?;
+    println!("Waiting for token (timeout in 2 minutes)...");
+
+    // Add a timeout to prevent hanging forever
+    let token = match tokio_time::timeout(Duration::from_secs(120), rx).await {
+        Ok(Ok(t)) => t,
+        Ok(Err(_)) => return Err(anyhow!("OAuth channel closed without receiving token")),
+        Err(_) => return Err(anyhow!("Timed out waiting for login")),
+    };
+
+    // Wait for the server task to shut down gracefully
+    let _ = server.await;
+
     save_token(&token).await?;
     Ok(token)
 }
@@ -385,9 +434,12 @@ fn build_auth_url(client_id: &str) -> String {
 }
 
 async fn start_oauth_server(tx: oneshot::Sender<String>) -> Result<JoinHandle<()>> {
-    let listener = TcpListener::bind(("127.0.0.1", 3000))
+    let listener = TcpListener::bind(("127.0.0.1", PORT))
         .await
-        .context("failed to bind local OAuth callback server on port 3000")?;
+        .context(format!(
+            "failed to bind local OAuth callback server on port {PORT}"
+        ))?;
+
     let handle = tokio::spawn(async move {
         if let Err(err) = run_oauth_server(listener, tx).await {
             eprintln!("OAuth callback server error: {err:?}");
@@ -570,14 +622,22 @@ async fn get_user_id(client: &Client) -> Result<String> {
         .get(format!("{BASE_URL}/users"))
         .send()
         .await
-        .context("failed to call Twitch users endpoint")?
-        .error_for_status()
-        .context("Twitch users endpoint returned an error status")?;
+        .context("failed to call Twitch users endpoint")?;
+
+    // Check status before error_for_status consumes it, to allow upstream to handle 401
+    if response.status() == StatusCode::UNAUTHORIZED {
+        return Err(anyhow::Error::from(
+            response.error_for_status().unwrap_err(),
+        ));
+    }
 
     let payload: UsersResponse = response
+        .error_for_status()
+        .context("Twitch users endpoint returned an error status")?
         .json()
         .await
         .context("failed to parse Twitch user response")?;
+
     payload
         .data
         .into_iter()
@@ -601,14 +661,21 @@ async fn get_live_followed_channels(client: &Client, user_id: &str) -> Result<Ve
             .query(&params)
             .send()
             .await
-            .context("failed to call Twitch streams endpoint")?
-            .error_for_status()
-            .context("Twitch streams endpoint returned an error status")?;
+            .context("failed to call Twitch streams endpoint")?;
+
+        if response.status() == StatusCode::UNAUTHORIZED {
+            return Err(anyhow::Error::from(
+                response.error_for_status().unwrap_err(),
+            ));
+        }
 
         let payload: StreamsResponse = response
+            .error_for_status()
+            .context("Twitch streams endpoint returned an error status")?
             .json()
             .await
             .context("failed to parse Twitch streams response")?;
+
         channels.extend(payload.data);
         cursor = payload.pagination.and_then(|p| p.cursor);
         if cursor.is_none() {
