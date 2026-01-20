@@ -88,7 +88,6 @@ impl Api {
                 .json()
                 .await
                 .context("failed to parse Twitch streams response")?;
-            println!("{:?}", payload.data);
             channels.extend(payload.data);
 
             cursor = payload.pagination.and_then(|p| p.cursor);
@@ -133,9 +132,9 @@ fn build_client(token: &str, client_id: &str) -> Result<Client> {
 }
 
 pub fn is_unauthorized(err: &anyhow::Error) -> bool {
-    err.downcast_ref::<reqwest::Error>()
-        .and_then(|e| e.status())
-        .is_some_and(|s| s == StatusCode::UNAUTHORIZED)
+    err.chain()
+        .filter_map(|cause| cause.downcast_ref::<reqwest::Error>())
+        .any(|e| e.status() == Some(StatusCode::UNAUTHORIZED))
 }
 
 // API response types
