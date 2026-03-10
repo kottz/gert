@@ -1,54 +1,46 @@
 use anyhow::{Context, Result};
-use reqwest::{
-    header::{HeaderMap, HeaderValue, AUTHORIZATION},
-    Client, StatusCode,
-};
 use serde::{Deserialize, Serialize};
+use ureq::Agent;
 
 use crate::{config::Config, oauth, storage};
 
 const BASE_URL: &str = "https://api.twitch.tv/helix";
 
 pub struct Api {
-    client: Client,
+    client: Agent,
     client_id: String,
+    token: String,
 }
 
 impl Api {
-    pub async fn new(config: &Config) -> Result<Self> {
-        let token = get_or_request_token(&config.client_id).await?;
-        let client = build_client(&token, &config.client_id)?;
+    pub fn new(config: &Config) -> Result<Self> {
+        let token = get_or_request_token(&config.client_id)?;
+        let client = build_client()?;
 
         Ok(Self {
             client,
             client_id: config.client_id.clone(),
+            token,
         })
     }
 
-    pub async fn refresh_auth(&mut self) -> Result<()> {
-        storage::delete_token().await?;
-        let token = get_or_request_token(&self.client_id).await?;
-        self.client = build_client(&token, &self.client_id)?;
+    pub fn refresh_auth(&mut self) -> Result<()> {
+        storage::delete_token()?;
+        self.token = get_or_request_token(&self.client_id)?;
+        self.client = build_client()?;
         Ok(())
     }
 
-    pub async fn get_user_id(&self) -> Result<String> {
+    pub fn get_user_id(&self) -> Result<String> {
         let response = self
-            .client
-            .get(format!("{BASE_URL}/users"))
-            .send()
-            .await
-            .context("failed to call Twitch users endpoint")?;
-
-        if response.status() == StatusCode::UNAUTHORIZED {
-            return Err(response.error_for_status().unwrap_err().into());
-        }
+            .authorized_get(&format!("{BASE_URL}/users"))
+            .call()
+            .map_err(|err| {
+                anyhow::Error::new(err).context("failed to call Twitch users endpoint")
+            })?;
 
         let payload: UsersResponse = response
-            .error_for_status()
-            .context("Twitch users endpoint returned error")?
-            .json()
-            .await
+            .into_json()
             .context("failed to parse Twitch user response")?;
 
         payload
@@ -59,34 +51,24 @@ impl Api {
             .context("Twitch API returned no user data")
     }
 
-    pub async fn get_live_followed_channels(&self, user_id: &str) -> Result<Vec<LiveChannel>> {
+    pub fn get_live_followed_channels(&self, user_id: &str) -> Result<Vec<LiveChannel>> {
         let mut channels = Vec::new();
         let mut cursor: Option<String> = None;
 
         loop {
-            let mut request = self
-                .client
-                .get(format!("{BASE_URL}/streams/followed"))
-                .query(&[("user_id", user_id)]);
+            let mut request = self.authorized_get(&format!("{BASE_URL}/streams/followed"));
+            request = request.query("user_id", user_id);
 
             if let Some(ref c) = cursor {
-                request = request.query(&[("after", c)]);
+                request = request.query("after", c);
             }
 
-            let response = request
-                .send()
-                .await
-                .context("failed to call Twitch streams endpoint")?;
-
-            if response.status() == StatusCode::UNAUTHORIZED {
-                return Err(response.error_for_status().unwrap_err().into());
-            }
+            let response = request.call().map_err(|err| {
+                anyhow::Error::new(err).context("failed to call Twitch streams endpoint")
+            })?;
 
             let payload: StreamsResponse = response
-                .error_for_status()
-                .context("Twitch streams endpoint returned error")?
-                .json()
-                .await
+                .into_json()
                 .context("failed to parse Twitch streams response")?;
             channels.extend(payload.data);
 
@@ -98,43 +80,35 @@ impl Api {
 
         Ok(channels)
     }
+
+    fn authorized_get(&self, url: &str) -> ureq::Request {
+        self.client
+            .get(url)
+            .set("Client-Id", &self.client_id)
+            .set("Authorization", &format!("Bearer {}", self.token))
+    }
 }
 
-async fn get_or_request_token(client_id: &str) -> Result<String> {
-    if let Some(token) = storage::load_token().await {
+fn get_or_request_token(client_id: &str) -> Result<String> {
+    if let Some(token) = storage::load_token() {
         return Ok(token);
     }
 
     println!("Opening browser for Twitch login...");
-    let token = oauth::authenticate(client_id).await?;
-    storage::save_token(&token).await?;
+    let token = oauth::authenticate(client_id)?;
+    storage::save_token(&token)?;
 
     Ok(token)
 }
 
-fn build_client(token: &str, client_id: &str) -> Result<Client> {
-    let mut headers = HeaderMap::new();
-
-    headers.insert(
-        "Client-Id",
-        HeaderValue::from_str(client_id).context("invalid client id header")?,
-    );
-    headers.insert(
-        AUTHORIZATION,
-        HeaderValue::from_str(&format!("Bearer {token}"))
-            .context("invalid authorization header")?,
-    );
-
-    Client::builder()
-        .default_headers(headers)
-        .build()
-        .context("failed to build HTTP client")
+fn build_client() -> Result<Agent> {
+    Ok(ureq::AgentBuilder::new().user_agent("gert").build())
 }
 
 pub fn is_unauthorized(err: &anyhow::Error) -> bool {
     err.chain()
-        .filter_map(|cause| cause.downcast_ref::<reqwest::Error>())
-        .any(|e| e.status() == Some(StatusCode::UNAUTHORIZED))
+        .filter_map(|cause| cause.downcast_ref::<ureq::Error>())
+        .any(|e| matches!(e, ureq::Error::Status(401, _)))
 }
 
 // API response types

@@ -5,7 +5,6 @@ use std::{
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use tokio::fs;
 
 use crate::{config, twitch::LiveChannel};
 
@@ -25,12 +24,12 @@ struct TokenData {
     timestamp: Option<f64>,
 }
 
-pub async fn load_token() -> Option<String> {
-    load_token_data().await.access_token
+pub fn load_token() -> Option<String> {
+    load_token_data().access_token
 }
 
-pub async fn save_token(token: &str) -> Result<()> {
-    let mut data = load_token_data().await;
+pub fn save_token(token: &str) -> Result<()> {
+    let mut data = load_token_data();
     let token_changed = data.access_token.as_deref() != Some(token);
 
     data.access_token = Some(token.to_string());
@@ -40,44 +39,42 @@ pub async fn save_token(token: &str) -> Result<()> {
         data.user_id = None;
     }
 
-    write_token_data(&data).await
+    write_token_data(&data)
 }
 
-pub async fn delete_token() -> Result<()> {
+pub fn delete_token() -> Result<()> {
     let path = token_file_path()?;
-    if fs::try_exists(&path).await.unwrap_or(false) {
-        fs::remove_file(&path).await.ok();
+    if path.exists() {
+        std::fs::remove_file(&path).ok();
     }
     Ok(())
 }
 
-pub async fn load_user_id() -> Option<String> {
-    load_token_data().await.user_id
+pub fn load_user_id() -> Option<String> {
+    load_token_data().user_id
 }
 
-pub async fn save_user_id(user_id: &str) -> Result<()> {
-    let mut data = load_token_data().await;
+pub fn save_user_id(user_id: &str) -> Result<()> {
+    let mut data = load_token_data();
     data.user_id = Some(user_id.to_string());
-    write_token_data(&data).await
+    write_token_data(&data)
 }
 
-async fn load_token_data() -> TokenData {
+fn load_token_data() -> TokenData {
     let Ok(path) = token_file_path() else {
         return TokenData::default();
     };
 
-    fs::read_to_string(&path)
-        .await
+    std::fs::read_to_string(&path)
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default()
 }
 
-async fn write_token_data(data: &TokenData) -> Result<()> {
+fn write_token_data(data: &TokenData) -> Result<()> {
     let path = token_file_path()?;
     let json = serde_json::to_string(data).context("failed to serialize token data")?;
-    fs::write(&path, json)
-        .await
+    std::fs::write(&path, json)
         .with_context(|| format!("failed to write token file at {}", path.display()))
 }
 
@@ -97,9 +94,9 @@ pub struct CachePayload {
     pub channels: Vec<LiveChannel>,
 }
 
-pub async fn load_cache() -> Option<CachePayload> {
+pub fn load_cache() -> Option<CachePayload> {
     let path = cache_file_path().ok()?;
-    let contents = fs::read_to_string(&path).await.ok()?;
+    let contents = std::fs::read_to_string(&path).ok()?;
     let payload: CachePayload = serde_json::from_str(&contents).ok()?;
 
     let age = current_timestamp() - payload.timestamp?;
@@ -110,7 +107,7 @@ pub async fn load_cache() -> Option<CachePayload> {
     Some(payload)
 }
 
-pub async fn save_cache(user_id: &str, channels: &[LiveChannel]) -> Result<()> {
+pub fn save_cache(user_id: &str, channels: &[LiveChannel]) -> Result<()> {
     let payload = CachePayload {
         user_id: Some(user_id.to_string()),
         timestamp: Some(current_timestamp()),
@@ -119,8 +116,7 @@ pub async fn save_cache(user_id: &str, channels: &[LiveChannel]) -> Result<()> {
 
     let path = cache_file_path()?;
     let json = serde_json::to_string(&payload).context("failed to serialize cache")?;
-    fs::write(&path, json)
-        .await
+    std::fs::write(&path, json)
         .with_context(|| format!("failed to write cache file at {}", path.display()))
 }
 

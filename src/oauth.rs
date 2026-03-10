@@ -1,13 +1,11 @@
-use std::{io, time::Duration};
+use std::{
+    io::{self, Read, Write},
+    net::{TcpListener, TcpStream},
+    sync::mpsc,
+    time::Duration,
+};
 
 use anyhow::{anyhow, Context, Result};
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::{TcpListener, TcpStream},
-    sync::oneshot,
-    time::timeout,
-};
-use url::form_urlencoded;
 
 const PORT: u16 = 44764;
 const REDIRECT_URI: &str = "http://localhost:44764";
@@ -31,30 +29,31 @@ if (token) {
 </body></html>"#;
 
 /// Opens browser for Twitch OAuth and waits for the callback with the access token.
-pub async fn authenticate(client_id: &str) -> Result<String> {
+pub fn authenticate(client_id: &str) -> Result<String> {
     let auth_url = build_auth_url(client_id);
-    let (tx, rx) = oneshot::channel();
+    let (tx, rx) = mpsc::channel();
 
     // Start callback server before opening browser
-    let listener = TcpListener::bind(("127.0.0.1", PORT))
-        .await
-        .context(format!(
-            "failed to bind OAuth callback server on port {PORT}"
-        ))?;
+    let listener = TcpListener::bind(("127.0.0.1", PORT)).context(format!(
+        "failed to bind OAuth callback server on port {PORT}"
+    ))?;
 
-    let server_handle = tokio::spawn(run_callback_server(listener, tx));
+    let server_handle = std::thread::spawn(move || run_callback_server(listener, tx));
 
-    webbrowser::open(&auth_url).context("failed to open browser")?;
+    println!("Open this URL in your browser to authenticate:");
+    println!("{auth_url}");
     println!("Waiting for login (timeout in 2 minutes)...");
 
-    let token = match timeout(LOGIN_TIMEOUT, rx).await {
-        Ok(Ok(token)) => token,
-        Ok(Err(_)) => return Err(anyhow!("OAuth channel closed unexpectedly")),
-        Err(_) => return Err(anyhow!("Timed out waiting for login")),
+    let token = match rx.recv_timeout(LOGIN_TIMEOUT) {
+        Ok(token) => token,
+        Err(mpsc::RecvTimeoutError::Timeout) => return Err(anyhow!("Timed out waiting for login")),
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            return Err(anyhow!("OAuth channel closed unexpectedly"));
+        }
     };
 
     // Let server finish gracefully
-    let _ = server_handle.await;
+    let _ = server_handle.join();
 
     Ok(token)
 }
@@ -64,13 +63,13 @@ fn build_auth_url(client_id: &str) -> String {
     format!("{AUTH_BASE_URL}?client_id={client_id}&redirect_uri={REDIRECT_URI}&response_type=token&scope={scope}")
 }
 
-async fn run_callback_server(listener: TcpListener, tx: oneshot::Sender<String>) -> Result<()> {
+fn run_callback_server(listener: TcpListener, tx: mpsc::Sender<String>) -> Result<()> {
     let mut tx = Some(tx);
 
     loop {
-        let (mut stream, _) = listener.accept().await?;
+        let (mut stream, _) = listener.accept()?;
 
-        if let Some(token) = handle_request(&mut stream).await? {
+        if let Some(token) = handle_request(&mut stream)? {
             if let Some(sender) = tx.take() {
                 let _ = sender.send(token);
             }
@@ -81,10 +80,12 @@ async fn run_callback_server(listener: TcpListener, tx: oneshot::Sender<String>)
     Ok(())
 }
 
-async fn handle_request(stream: &mut TcpStream) -> Result<Option<String>> {
-    let request = match timeout(REQUEST_TIMEOUT, read_request(stream)).await {
-        Ok(Ok(req)) => req,
-        _ => return Ok(None),
+fn handle_request(stream: &mut TcpStream) -> Result<Option<String>> {
+    stream.set_read_timeout(Some(REQUEST_TIMEOUT)).ok();
+
+    let request = match read_request(stream) {
+        Ok(req) => req,
+        Err(_) => return Ok(None),
     };
 
     let request_line = request.lines().next().unwrap_or("").trim();
@@ -102,8 +103,7 @@ async fn handle_request(stream: &mut TcpStream) -> Result<Option<String>> {
             "405 Method Not Allowed",
             "Method not allowed",
             "text/plain",
-        )
-        .await?;
+        )?;
         return Ok(None);
     }
 
@@ -115,8 +115,7 @@ async fn handle_request(stream: &mut TcpStream) -> Result<Option<String>> {
                 "200 OK",
                 "Token received. You can close this tab.",
                 "text/plain",
-            )
-            .await?;
+            )?;
             return Ok(Some(token));
         }
         send_response(
@@ -124,22 +123,21 @@ async fn handle_request(stream: &mut TcpStream) -> Result<Option<String>> {
             "400 Bad Request",
             "Missing access token",
             "text/plain",
-        )
-        .await?;
+        )?;
         return Ok(None);
     }
 
     // Serve the token capture page for the initial redirect
-    send_response(stream, "200 OK", TOKEN_CAPTURE_PAGE, "text/html").await?;
+    send_response(stream, "200 OK", TOKEN_CAPTURE_PAGE, "text/html")?;
     Ok(None)
 }
 
-async fn read_request(stream: &mut TcpStream) -> io::Result<String> {
+fn read_request(stream: &mut TcpStream) -> io::Result<String> {
     let mut buffer = Vec::with_capacity(4096);
     let mut chunk = [0u8; 1024];
 
     loop {
-        let n = stream.read(&mut chunk).await?;
+        let n = stream.read(&mut chunk)?;
         if n == 0 {
             break;
         }
@@ -160,7 +158,7 @@ async fn read_request(stream: &mut TcpStream) -> io::Result<String> {
     Ok(String::from_utf8_lossy(&buffer).into_owned())
 }
 
-async fn send_response(
+fn send_response(
     stream: &mut TcpStream,
     status: &str,
     body: &str,
@@ -175,11 +173,55 @@ async fn send_response(
          {body}",
         body.len()
     );
-    stream.write_all(response.as_bytes()).await
+    stream.write_all(response.as_bytes())
 }
 
 fn extract_token(query: &str) -> Option<String> {
-    form_urlencoded::parse(query.as_bytes())
-        .find(|(k, _)| k == "access_token")
-        .map(|(_, v)| v.into_owned())
+    query.split('&').find_map(|part| {
+        let (raw_key, raw_value) = part.split_once('=')?;
+        if percent_decode(raw_key) == "access_token" {
+            Some(percent_decode(raw_value))
+        } else {
+            None
+        }
+    })
+}
+
+fn percent_decode(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = String::with_capacity(input.len());
+    let mut i = 0;
+
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => {
+                out.push(' ');
+                i += 1;
+            }
+            b'%' if i + 2 < bytes.len() => {
+                if let (Some(h), Some(l)) = (hex_value(bytes[i + 1]), hex_value(bytes[i + 2])) {
+                    out.push((h * 16 + l) as char);
+                    i += 3;
+                    continue;
+                }
+                out.push('%');
+                i += 1;
+            }
+            b => {
+                out.push(b as char);
+                i += 1;
+            }
+        }
+    }
+
+    out
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
